@@ -11,6 +11,9 @@ use Illuminate\Http\Request;
 use DTApi\Repository\BookingRepository;
 use Exception;
 use Illuminate\Support\Facades\DB;
+use DTApi\Helpers\NotficationHelper;
+
+use function DTApi\Helpers\resend_notification;
 
 /**
  * Class BookingController
@@ -18,6 +21,7 @@ use Illuminate\Support\Facades\DB;
  */
 class BookingController extends Controller
 {
+
 
     /**
      * Variable Declaration
@@ -44,21 +48,38 @@ class BookingController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
-        $userId = $request->input('user_id'); // get the input of user_id from the input
+        // validate input to properly handle errors
+        $validated = $request->validate([
+            'user_id' => 'nullable|integer|exists:users,id',
+        ]);
+
+        $userId = $validated['user_id'] ?? null;
         $authUser = auth()->user(); // retrieve the authenticated user
 
-        if($userId) {
-            // return user jobs of the specific user_id
-            $jobs = $this->bookingRepository->getUsersJobs($userId);
-        } elseif(in_array($authUser->user_type, [UserType::ADMIN_ROLE_ID, UserType::SUPERADMIN_ROLE_ID])) {
-            $jobs = $this->bookingRepository->getAll($request);
-        } else {
-            return response()->json([
-                'error' => 'Forbidden Access',
-            ], Response::HTTP_FORBIDDEN);
-        }
+        try {
+            if ($userId) {
+                $jobs = $this->bookingRepository->getUsersJobs($userId);
+            } elseif(in_array($authUser->user_type, [UserType::ADMIN_ROLE_ID, UserType::SUPERADMIN_ROLE_ID])) {
+                $jobs = $this->bookingRepository->getAll($request);
+            } else {
+                return $this->respondWithError(
+                    'Accessing this daa is forbidden',
+                    'Forbidden Access',
+                    Response::HTTP_FORBIDDEN
+                );
+            }
 
-        return JobResource::collection($jobs);
+            return $this->respondSuccessful(
+                JobResource::collection($jobs),
+                'Jobs successfully retrieved'
+            );
+
+        } catch (Exception $ex) {
+            return $this->respondWithError(
+                'Failed to retrieve records.',
+                $ex->getMessage()
+            );
+        }
     }
 
     /**
@@ -67,25 +88,56 @@ class BookingController extends Controller
      * 
      * Implement route model binding
      */
-    public function show(Job $job)
+    public function show(Job $job): JsonResponse
     {
-        // eager load the relationship for translatorJobRel
-        $job->load('translatorJobRel.user');
-
-        return JobResource::make($job);
+        try {
+            // eager load the relationship for translatorJobRel
+            $job->load('translatorJobRel.user');
+        } catch (ModelNotFoundException $ex) {
+            return $this->respondWithError(
+                'Record not found',
+                $ex->getMessage(),
+                Response::HTTP_NOT_FOUND
+            );
+        } catch (Exception $ex) {
+            return $this->respondWithError(
+                'Failed to retrieve any record',
+                $ex->getMessage(),
+                Response::HTTP_NOT_FOUND
+            );
+        }
+        
+        return $this->respondSuccessful(
+            JobResource::make($job),
+            'Record retrieved successfully'
+        );
     }
 
     /**
      * @param Request $request
      * @return mixed
      */
-    public function store(StoreBookingRequest $request): JobResource
+    public function store(StoreBookingRequest $request): JsonResponse
     {
-        $data = $request->all();
+        // get the validated data
+        $data = $request->validated();
+        $user = auth()->user();
 
-        $job = $this->bookingRepository->store($request->user(), $data);
+        try {
+            $job = $this->bookingRepository->store($user, $data);
+        } catch (Exception $ex) {
+            return $this->respondWithError(
+                'Record creation failed',
+                $ex->getMessage(),
+                Response::HTTP_UNPROCESSABLE_ENTITY
+            );
+        }
 
-        return JobResource::make($job);
+        return $this->respondSuccessful(
+            JobResource::make($job),
+            'Record created successfully',
+            Response::HTTP_CREATED
+        );
 
     }
 
@@ -94,14 +146,25 @@ class BookingController extends Controller
      * @param Request $request
      * @return mixed
      */
-    public function update(UpdateBookingRequest $request, Job $job): JobResource
+    public function update(UpdateBookingRequest $request, Job $job): JsonResponse
     {
         $user = auth()->user();
         $job->update($request->validated());
         
-        $response = $this->repository->updateJob($id, array_except($data, ['_token', 'submit']), $user);
+        try {
+            $job = $this->bookingRepository->updateJob($id, array_except($data, ['_token', 'submit']), $user);
+        } catch (Exception $ex) {
+            return $this->respondWithError(
+                'Record update failed',
+                $ex->getMessage(),
+                Response::HTTP_UNPROCESSABLE_ENTITY
+            );
+        }
 
-        return JobResource::make($response);
+        return $this->respondSuccessful(
+            JobResource::make($job),
+            'Record updated successfully'
+        );
     }
 
     /**
@@ -110,9 +173,21 @@ class BookingController extends Controller
      */
     public function immediateJobEmail(JobEmailRequest $request): JsonResponse
     {
-        $response = $this->bookingRepository->storeJobEmail($request->validated());
+        try {
+            $job = $this->bookingRepository->storeJobEmail($request->validated());
+        } catch (Exception $ex) {
+            return $this->respondWithError(
+                'Record update failed',
+                $ex->getMessage(),
+                Response::HTTP_UNPROCESSABLE_ENTITY
+            );
+        }
+
         // return job object after update job email
-        return response()->json($response);
+        return $this->respondSuccessful(
+            JobResource::make($job),
+            'Record updated successfully'
+        );
     }
 
     /**
@@ -124,6 +199,9 @@ class BookingController extends Controller
         $userId = $request->get('user_id');
         if($userId) {
             $response = $this->bookingRepository->getUsersJobsHistory($userId, $request);
+            return $this->respondSuccessful(
+
+            )
             return response()->json($response);
         }
         // return an empty array
@@ -258,32 +336,9 @@ class BookingController extends Controller
 
     public function resendNotifications(int $jobId)
     {
-        try {
-            $job = $this->bookingRepository->find($jobId);
-            $jobData = $this->bookingRepository->jobToData($job);
+        $result = resend_notification($jobId, $this->bookingRepository, 'push');
 
-            $this->bookingRepository->sendNotificationTranslator($job, $jobData, '*');
-
-            return response()->json([
-                'message' => 'Push sent',
-                'success' => true], 
-                Response::HTTP_OK
-            );
-        } catch (ModelNotFoundException $ex) {
-            // catch if job id does not exists in the database
-            return response()->json([
-                'message' => 'Job not found',
-                'error' => $ex->getMessage(),
-                'success' => false
-            ], Response::HTTP_NOT_FOUND);
-        } catch (Exception $ex) {
-            return response()->json([
-                'message' => 'Failed to send notification',
-                'error' => $ex->getMessage(),
-                'success' => false
-            ], Response::HTTP_INTERNAL_SERVER_ERROR);
-        }
-
+        return response()->json($result, $result['status']);
     }
 
     /**
@@ -293,22 +348,9 @@ class BookingController extends Controller
      */
     public function resendSMSNotifications(int $jobId)
     {
-        $job = $this->bookingRepository->find($jobId);
-        $job_data = $this->bookingRepository->jobToData($job);
+        $result = resend_notification($jobId, $this->bookingRepository, 'sms');
 
-        try {
-            $this->bookingRepository->sendSMSNotificationToTranslator($job);
-            return response([
-                'message' => 'SMS sent',
-                'success' => true
-            ], Response::HTTP_OK);
-        } catch (\Exception $ex) {
-            return response([
-                'message' => 'SMS notification failed',
-                'error' => $ex->getMessage(),
-                'success' => false
-            ]);
-        }
+        return response()->json($result, $result['status']);
     }
 
     private function checkJobAttributes(array $data): array
